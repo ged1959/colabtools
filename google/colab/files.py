@@ -31,7 +31,7 @@ from six.moves import SimpleHTTPServer as _SimpleHTTPServer
 from six.moves import socketserver as _socketserver
 from six.moves import urllib as _urllib
 
-__all__ = ['upload', 'download', 'view']
+__all__ = ['upload', 'upload_file', 'download', 'view']
 
 
 def upload():
@@ -42,28 +42,81 @@ def upload():
   Returns:
     A map of the form {<filename>: <file contents>} for all uploaded files.
   """
+
+  uploaded_files = _upload_files(multiple=True)
+  # Mapping from original filename to filename as saved locally.
+  local_filenames = dict()
+  for filename, data in uploaded_files.items():
+    local_filename = local_filenames.get(filename)
+    if not local_filename:
+      local_filename = _get_unique_filename(filename)
+      local_filenames[filename] = local_filename
+      print('Saving {filename} to {local_filename}'.format(
+          filename=filename, local_filename=local_filename))
+    with open(local_filename, 'ab') as f:
+      f.write(data)
+  return uploaded_files
+
+
+def upload_file(filepath):
+  """Render a widget to upload local (to the browser) files to the kernel.
+
+  Blocks until the files are available.
+
+  Args:
+    filepath: (optional, str) If set, the uploaded file will be saved to this
+      path instead of using the name of the uploaded file.
+
+  Returns:
+    A 2-element tuple of (filename, contents), or None if uploading was
+    cancelled.
+  """
+  uploaded_file = _upload_files(multiple=False)
+  if not uploaded_file:
+    return
+  filename = list(uploaded_file.keys())[0]
+  data = uploaded_file[filename]
+  filename = filepath or _get_unique_filename(filename)
+  with open(filename, 'wb') as f:
+    f.write(data)
+  return (filename, data)
+
+
+def _upload_files(multiple):
+  """Render a widget to upload local (to the browser) files to the kernel.
+
+  Files are not written to storage.
+
+  Blocks until the files are available.
+
+  Args:
+    multiple: (bool) Whether to show a multiple or single file upload dialog.
+
+  Returns:
+    A map of the form {<filename>: <file contents>} for all uploaded files.
+  """
   upload_id = str(_uuid.uuid4())
   input_id = 'files-' + upload_id
   output_id = 'result-' + upload_id
 
   _IPython.display.display(
       _IPython.core.display.HTML("""
-     <input type="file" id="{input_id}" name="files[]" multiple disabled
+     <input type="file" id="{input_id}" name="files[]" {multiple_text} disabled
         style="border:none" />
      <output id="{output_id}">
       Upload widget is only available when the cell has been executed in the
       current browser session. Please rerun this cell to enable.
       </output>
       <script src="/nbextensions/google.colab/files.js"></script> """.format(
-          input_id=input_id, output_id=output_id)))
+          input_id=input_id,
+          output_id=output_id,
+          multiple_text='multiple' if multiple else '')))
 
   # First result is always an indication that the file picker has completed.
   result = _output.eval_js(
       'google.colab._files._uploadFiles("{input_id}", "{output_id}")'.format(
           input_id=input_id, output_id=output_id))
   files = _collections.defaultdict(_six.binary_type)
-  # Mapping from original filename to filename as saved locally.
-  local_filenames = dict()
 
   while result['action'] != 'complete':
     result = _output.eval_js(
@@ -74,18 +127,7 @@ def upload():
       # steps may not produce data for the Python side, so just proceed onto the
       # next message.
       continue
-    data = _base64.b64decode(result['data'])
-    filename = result['file']
-
-    files[filename] += data
-    local_filename = local_filenames.get(filename)
-    if not local_filename:
-      local_filename = _get_unique_filename(filename)
-      local_filenames[filename] = local_filename
-      print('Saving {filename} to {local_filename}'.format(
-          filename=filename, local_filename=local_filename))
-    with open(local_filename, 'ab') as f:
-      f.write(data)
+    files[result['file']] += _base64.b64decode(result['data'])
 
   return dict(files)
 

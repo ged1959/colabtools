@@ -29,11 +29,40 @@ import tempfile as _tempfile
 import time as _time
 
 from google.colab import errors as _errors
+from google.colab import files as _files
 from google.colab import output as _output
 
-__all__ = ['authenticate_user']
+__all__ = ['authenticate_service_account', 'authenticate_user']
 
 _LOGGER = _logging.getLogger(__name__)
+
+
+def _check_service_account_adc():
+  """Return whether the application default credentials exist and are for a service account."""
+  # Avoid forcing a kernel restart on users updating google.auth if they haven't
+  # yet used google.auth.
+  import google.auth as _google_auth  # pylint: disable=g-import-not-at-top
+  try:
+    _google_auth.default()
+  except _google_auth.exceptions.DefaultCredentialsError:
+    return False
+  try:
+    with open(_get_adc_path()) as auth_info:
+      return _is_service_account_key(auth_info.read())
+  except FileNotFoundError:
+    pass
+  return False
+
+
+def _is_service_account_key(key_json_text):
+  """Return true if the provided text is a JSON service account key."""
+  try:
+    key_obj = _json.loads(key_json_text)
+  except _json.JSONDecodeError:
+    return False
+  if not key_obj or key_obj['type'] != 'service_account':
+    return False
+  return True
 
 
 def _check_adc():
@@ -129,6 +158,26 @@ def _noop():
   yield
 
 
+def _setup_tpu_auth():
+  """Pass current ADC to Tensorflow to setup auth."""
+  colab_tpu_addr = _os.environ.get('COLAB_TPU_ADDR', '')
+  if 'COLAB_SKIP_AUTOMATIC_TPU_AUTH' not in _os.environ and colab_tpu_addr:
+    # If we've got a TPU attached, we want to run a TF operation to provide
+    # our new credentials to the TPU for GCS operations.
+    import tensorflow as tf  # pylint: disable=g-import-not-at-top
+    if tf.__version__.startswith('1'):
+      with tf.compat.v1.Session('grpc://{}'.format(colab_tpu_addr)) as sess:
+        with open(_get_adc_path()) as auth_info:
+          tf.contrib.cloud.configure_gcs(
+              sess, credentials=_json.load(auth_info))
+    else:
+      # pytype: skip-file
+      tf.config.experimental_connect_to_cluster(
+          tf.distribute.cluster_resolver.TPUClusterResolver())
+      import tensorflow_gcs_config as _tgc  # pylint: disable=g-import-not-at-top
+      _tgc.configure_gcs_from_colab_auth()
+
+
 # pylint:disable=line-too-long
 def authenticate_user(clear_output=True):
   """Ensures that the given user is authenticated.
@@ -139,8 +188,8 @@ def authenticate_user(clear_output=True):
 
   Args:
     clear_output: (optional, default: True) If True, clear any output related to
-        the authorization process if it completes successfully. Any errors will
-        remain (for debugging purposes).
+      the authorization process if it completes successfully. Any errors will
+      remain (for debugging purposes).
 
   Returns:
     None.
@@ -158,22 +207,45 @@ def authenticate_user(clear_output=True):
     with context_manager():
       _gcloud_login()
     _install_adc()
-    colab_tpu_addr = _os.environ.get('COLAB_TPU_ADDR', '')
-    if 'COLAB_SKIP_AUTOMATIC_TPU_AUTH' not in _os.environ and colab_tpu_addr:
-      # If we've got a TPU attached, we want to run a TF operation to provide
-      # our new credentials to the TPU for GCS operations.
-      import tensorflow as tf  # pylint: disable=g-import-not-at-top
-      if tf.__version__.startswith('1'):
-        with tf.compat.v1.Session('grpc://{}'.format(colab_tpu_addr)) as sess:
-          with open(_get_adc_path()) as auth_info:
-            tf.contrib.cloud.configure_gcs(
-                sess, credentials=_json.load(auth_info))
-      else:
-        # pytype: skip-file
-        tf.config.experimental_connect_to_cluster(
-            tf.distribute.cluster_resolver.TPUClusterResolver())
-        import tensorflow_gcs_config as _tgc  # pylint: disable=g-import-not-at-top
-        _tgc.configure_gcs_from_colab_auth()
+    _setup_tpu_auth()
   if _check_adc():
+    return
+  raise _errors.AuthorizationError('Failed to fetch user credentials')
+
+
+def authenticate_service_account():
+  """Ensures that a service account key is present and valid.
+
+  Returns:
+    None.
+
+  Raises:
+    errors.AuthorizationError: If authorization fails.
+  """
+  if _os.path.exists('/var/colab/mp'):
+    raise NotImplementedError(__name__ + ' is unsupported in this environment.')
+  if _check_service_account_adc():
+    return
+  _os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = _get_adc_path()
+  if not _check_service_account_adc():
+    with _output.temporary():
+      print(
+          'Upload the private key for your service account.\n\nSee the guide at https://cloud.google.com/iam/docs/creating-managing-service-account-keys#iam-service-account-keys-create-console for help.\n\n'
+      )
+      # TODO(b/223277695): Offer programmatic option, https://cloud.google.com/iam/docs/creating-managing-service-account-keys#iam-service-account-keys-create-gcloud
+      while True:
+        uploaded_file = _files.upload_file(_get_adc_path())
+        if not uploaded_file:
+          # Upload was cancelled.
+          return
+        _, content = uploaded_file
+        if _is_service_account_key(content):
+          _setup_tpu_auth()
+          break
+        print('Invalid credentials: please try again.\n\n')
+  if _check_service_account_adc():
+    import google.auth as _google_auth  # pylint: disable=g-import-not-at-top
+    creds, _ = _google_auth.default()
+    print('Successfully saved credentials for', creds.service_account_email)
     return
   raise _errors.AuthorizationError('Failed to fetch user credentials')
